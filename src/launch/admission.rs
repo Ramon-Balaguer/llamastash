@@ -191,31 +191,89 @@ pub fn dir_weight_bytes(dir: &std::path::Path) -> u64 {
     .fold(0u64, u64::saturating_add)
 }
 
+/// Returns whether the current process is running inside an LXC container.
+///
+/// LXC exposes this through the standard systemd container marker when
+/// systemd is available. The cgroup and PID 1 environment fallbacks cover
+/// containers where that marker is absent.
+///
+/// This is intentionally kept local to admission rather than surfaced in
+/// `HostMetricsSnapshot`: containerisation is a property of the process
+/// environment, not GPU hardware.
+#[cfg(target_os = "linux")]
+fn running_in_lxc() -> bool {
+  if let Ok(container) = std::fs::read_to_string("/run/systemd/container") {
+    if container.trim() == "lxc" {
+      return true;
+    }
+  }
+
+  if let Ok(environ) = std::fs::read("/proc/1/environ") {
+    if environ
+      .split(|byte| *byte == 0)
+      .any(|entry| entry == b"container=lxc")
+    {
+      return true;
+    }
+  }
+
+  if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+    if cgroup.lines().any(|line| {
+      line.contains("/lxc/")
+        || line.ends_with("/lxc")
+        || line.contains("name=lxc")
+    }) {
+      return true;
+    }
+  }
+
+  false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_in_lxc() -> bool {
+  false
+}
+
+fn use_lxc_amd_gtt_budget(snap: &HostMetricsSnapshot, lxc: bool) -> bool {
+  lxc
+    && snap.gpu_backend == HostMetricsSnapshot::BACKEND_AMD
+    && snap.unified
+    && snap.uma_shared_total_bytes.is_some()
+}
+
 /// Post-headroom free bytes across the budget pool(s). Discrete hosts
 /// sum post-headroom VRAM free + post-headroom system-RAM free.
 ///
-/// UMA hosts budget the **GPU pool**, not all of system RAM. On an
-/// AMD/Intel integrated APU the GPU can only allocate within the amdgpu
-/// GTT cap (carve-out + GTT), which on a default-config box is roughly
-/// half of system RAM. llama.cpp's own free reading conflates the two
-/// and hard-OOMs (it sees system-RAM free, allocates past the GTT cap,
-/// and `hipMalloc` fails); sysfs GTT is the budget authority. So when
-/// the snapshot carries the GTT pool (`uma_shared_*`, from the sysfs
-/// probe) we budget `min(ram_free, gtt_free)` — the GTT cap bounds the
-/// GPU allocation, and `ram_free` still guards the rare case where
-/// system RAM is the tighter constraint. Apple Silicon has no GTT carve
-/// (it leaves `uma_shared_*` unset), so it falls back to `ram_free` with
-/// its 0.75 headroom.
+/// UMA hosts normally budget `min(ram_free, gtt_free)` because both the
+/// GPU's GTT cap and available system RAM can be limiting resources. There
+/// is one container-specific exception: on Linux AMD UMA APUs inside an LXC,
+/// the LXC memory limit applies to the container's CPU-side RAM accounting,
+/// while the amdgpu GTT pool exposed to the container is the GPU allocation
+/// budget. In that environment using the container's `MemAvailable` as a
+/// second GPU limit incorrectly caps a 96 GiB Radeon 8060S to the LXC's 8 GiB
+/// memory limit.
+///
+/// The exception is deliberately narrow: only Linux LXC + AMD + unified GPU
+/// + sampled GTT data uses the GTT pool directly. Bare-metal AMD/Intel UMA,
+/// Apple Silicon, and other container runtimes keep the existing conservative
+/// `min(ram_free, gtt_free)` policy.
 pub fn effective_free_bytes(snap: &HostMetricsSnapshot) -> u64 {
+  effective_free_bytes_for(snap, running_in_lxc())
+}
+
+fn effective_free_bytes_for(snap: &HostMetricsSnapshot, lxc: bool) -> u64 {
   let ram_free = snap.ram_total_bytes.saturating_sub(snap.ram_used_bytes);
-  // Apple is unified by construction (the `|| apple_metal` just guards
-  // it); the host-pane VRAM gauge keys off the same `unified` flag.
   let unified = snap.unified || snap.gpu_backend == HostMetricsSnapshot::BACKEND_APPLE_METAL;
   if unified {
     let pool_free = match snap.uma_shared_total_bytes {
       Some(gtt_total) => {
         let gtt_free = gtt_total.saturating_sub(snap.uma_shared_used_bytes.unwrap_or(0));
-        ram_free.min(gtt_free)
+        if use_lxc_amd_gtt_budget(snap, lxc) {
+          gtt_free
+        } else {
+          ram_free.min(gtt_free)
+        }
       }
       None => ram_free,
     };
@@ -275,9 +333,6 @@ pub fn project_demand(
     cache_type_v: parse_cache_type(
       knobs.str_by_concept(backend_id, crate::launch::knobs::Concept::KvCacheVType),
     ),
-    // The GPU/RAM split is not modelled here — demand is the combined
-    // total against the combined pool free — so `n_gpu_layers` would be
-    // ignored downstream. Left unset rather than threaded in.
     n_gpu_layers: None,
   };
   resident_weight_bytes
@@ -312,9 +367,6 @@ mod tests {
 
   const GIB: u64 = 1024 * 1024 * 1024;
 
-  /// The gate's only weight source for a directory launched from outside the
-  /// scan roots, so a wrong answer here silently disarms the OOM refusal.
-  /// Sizes come from the link target, the way the HF cache stores weights.
   #[test]
   fn dir_weight_bytes_follows_links_and_ignores_subdirectories() {
     let dir = crate::util::test_temp::unique_temp_dir("admission-dir-weight");
@@ -332,7 +384,6 @@ mod tests {
       std::os::unix::fs::symlink(blobs.join("sha-b"), snapshot.join("b.safetensors"))
         .expect("link b");
     }
-    // A nested directory contributes nothing; only files directly inside do.
     std::fs::create_dir_all(snapshot.join("nested")).expect("nested");
     std::fs::write(snapshot.join("nested").join("ignored"), vec![0u8; 9999]).expect("ignored");
 
@@ -352,12 +403,9 @@ mod tests {
   #[test]
   fn refuses_when_demand_exceeds_free_minus_reservations() {
     let ledger = Ledger::default();
-    // First model reserves 44 GiB of a 60 GiB pool.
     ledger
       .try_admit(1, 44 * GIB, 60 * GIB)
       .expect("first admits");
-    // Second model wants 37 GiB; only 16 GiB remains → refused, never
-    // double-booked against the same free reading.
     let refusal = ledger
       .try_admit(2, 37 * GIB, 60 * GIB)
       .expect_err("second must be refused");
@@ -400,7 +448,7 @@ mod tests {
     ledger.try_admit(1, 10 * GIB, 60 * GIB).unwrap();
     ledger.try_admit(2, 10 * GIB, 60 * GIB).unwrap();
     ledger.release(1);
-    ledger.release(1); // no-op second time
+    ledger.release(1);
     assert_eq!(ledger.reserved_bytes(), 10 * GIB);
   }
 
@@ -426,25 +474,16 @@ mod tests {
 
   #[test]
   fn uma_budget_falls_back_to_ram_when_gtt_unknown() {
-    // No sysfs GTT data on the snapshot → budget system-RAM free at the
-    // IntegratedUma 1.0 fraction.
     let s = snap(HostMetricsSnapshot::BACKEND_AMD, true, 128 * GIB, 28 * GIB);
     assert_eq!(effective_free_bytes(&s), 100 * GIB);
   }
 
   #[test]
   fn uma_budget_uses_gtt_pool_not_system_ram() {
-    // Default-config UMA box: the amdgpu GTT cap is ~half of system RAM.
-    // A resident model leaves plenty of system RAM free but little GTT.
-    // Admission must budget the GTT pool, or it admits a model that then
-    // hard-OOMs on hipMalloc (the exact conflation this feature defeats).
     let mut s = snap(HostMetricsSnapshot::BACKEND_AMD, true, 160 * GIB, 80 * GIB);
-    s.uma_shared_total_bytes = Some(80 * GIB); // GTT cap ~50% of RAM
-    s.uma_shared_used_bytes = Some(60 * GIB); // 20 GiB GTT free
-                                              // ram_free is 80 GiB but GTT free is only 20 GiB → budget GTT.
+    s.uma_shared_total_bytes = Some(80 * GIB);
+    s.uma_shared_used_bytes = Some(60 * GIB);
     assert_eq!(effective_free_bytes(&s), 20 * GIB);
-    // A 37 GiB launch is refused against the 20 GiB GTT pool, not
-    // admitted against the 80 GiB system-RAM figure.
     let ledger = Ledger::default();
     assert!(ledger
       .try_admit(1, 37 * GIB, effective_free_bytes(&s))
@@ -453,13 +492,60 @@ mod tests {
 
   #[test]
   fn uma_budget_clamps_to_ram_when_gtt_exceeds_ram_free() {
-    // Reference-box config: GTT raised to ~full RAM, so GTT free can
-    // exceed system-RAM free; min() keeps the tighter (RAM) bound.
     let mut s = snap(HostMetricsSnapshot::BACKEND_AMD, true, 128 * GIB, 70 * GIB);
     s.uma_shared_total_bytes = Some(124 * GIB);
-    s.uma_shared_used_bytes = Some(40 * GIB); // 84 GiB GTT free
-                                              // ram_free 58 GiB < gtt_free 84 GiB → budget the RAM bound.
+    s.uma_shared_used_bytes = Some(40 * GIB);
     assert_eq!(effective_free_bytes(&s), 58 * GIB);
+  }
+
+  #[test]
+  fn lxc_amd_uma_uses_gtt_budget_instead_of_container_ram() {
+    let mut s = snap(
+      HostMetricsSnapshot::BACKEND_AMD,
+      true,
+      8 * GIB,
+      1 * GIB,
+    );
+    s.uma_shared_total_bytes = Some(96 * GIB);
+    s.uma_shared_used_bytes = Some(2 * GIB);
+    assert_eq!(effective_free_bytes_for(&s, true), 94 * GIB);
+
+    let ledger = Ledger::default();
+    assert!(ledger
+      .try_admit(1, 36 * GIB, effective_free_bytes_for(&s, true))
+      .is_ok());
+  }
+
+  #[test]
+  fn bare_metal_amd_uma_keeps_ram_gtt_minimum() {
+    let mut s = snap(
+      HostMetricsSnapshot::BACKEND_AMD,
+      true,
+      128 * GIB,
+      100 * GIB,
+    );
+    s.uma_shared_total_bytes = Some(96 * GIB);
+    s.uma_shared_used_bytes = Some(20 * GIB);
+    assert_eq!(effective_free_bytes_for(&s, false), 28 * GIB);
+  }
+
+  #[test]
+  fn non_amd_lxc_uma_does_not_use_gtt_only_budget() {
+    let mut s = snap("nvidia", true, 8 * GIB, 1 * GIB);
+    s.uma_shared_total_bytes = Some(96 * GIB);
+    s.uma_shared_used_bytes = Some(2 * GIB);
+    assert_eq!(effective_free_bytes_for(&s, true), 7 * GIB);
+  }
+
+  #[test]
+  fn amd_uma_without_gtt_data_still_uses_ram() {
+    let s = snap(
+      HostMetricsSnapshot::BACKEND_AMD,
+      true,
+      8 * GIB,
+      1 * GIB,
+    );
+    assert_eq!(effective_free_bytes_for(&s, true), 7 * GIB);
   }
 
   #[test]
@@ -473,7 +559,6 @@ mod tests {
     let mut s = snap("nvidia", false, 128 * GIB, 64 * GIB);
     s.gpu_mem_total_bytes = Some(24 * GIB);
     s.gpu_mem_used_bytes = Some(8 * GIB);
-    // 16 GiB VRAM free + 64 GiB RAM free, both at 1.0 fraction.
     assert_eq!(effective_free_bytes(&s), 80 * GIB);
   }
 
@@ -487,13 +572,6 @@ mod tests {
 
   #[test]
   fn demand_uses_shard_aware_weight_total_not_header_tensors() {
-    use crate::gguf::header::GgufHeader;
-    // Empty header (no tensors): the per-shard `weights_bytes(header)`
-    // this used to call would be 0. A split GGUF launches off its
-    // primary shard, whose header omits every trailing shard's tensors,
-    // so the old path under-projected demand by those shards. With the
-    // shard-aware total threaded in, demand must reflect the passed
-    // weight total regardless of what the header carries.
     let header = GgufHeader {
       version: 3,
       tensor_count: 0,
@@ -501,7 +579,6 @@ mod tests {
       tensors: Vec::new(),
     };
     let knobs = crate::launch::knobs::KnobSet::new();
-    // arch `None` → KV term is 0, isolating weights + overhead band.
     let band = overhead_band_bytes(HostMetricsSnapshot::BACKEND_AMD);
     let demand = project_demand(
       &header,
@@ -518,8 +595,6 @@ mod tests {
       53 * GIB + band,
       "weights term is the shard-aware total, not the header's tensor sum"
     );
-    // MTP active adds a conservative weights-fraction band (weights / 6) on
-    // top, so a barely-fitting model's OOM gate isn't over-optimistic.
     let mtp_demand = project_demand(
       &header,
       None,
