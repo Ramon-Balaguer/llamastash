@@ -4,6 +4,10 @@ All notable changes to LlamaStash will be documented in this file. The format fo
 
 ## [Unreleased]
 
+### Fixed
+
+- **TUI Host pane VRAM gauge in Linux LXC containers on AMD UMA.** When running inside a Linux LXC container where container RAM is artificially limited, the VRAM denominator preserves the host's full GTT pool rather than clamping against the container's RAM limit.
+
 ## [0.3.0] — 2026-09-10
 
 This release lets one model run more than once. **Named launches** give every copy its own address: `start qwen3 --name coder` and that launch answers to `qwen3@coder` on the proxy, the CLI and the TUI, so a long-context copy and a fast copy can sit side by side. A request for a name that has stopped starts it again under the preset of that name, so an OpenAI-shaped client can pick a configuration without a CLI round trip. **Run preset files** are the other half: `llamastash run model.yml` starts one model with its own preset from a file you can commit next to a project, and nothing is written back to `config.yaml`.

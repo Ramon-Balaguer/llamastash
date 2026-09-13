@@ -191,41 +191,6 @@ pub fn dir_weight_bytes(dir: &std::path::Path) -> u64 {
     .fold(0u64, u64::saturating_add)
 }
 
-/// Detect an AMD/Intel unified-memory Linux container running inside an LXC.
-/// This is the specific case where the container sees an artificially low
-/// host RAM floor but the GPU stack still operates against the real GTT pool.
-fn linux_lxc_container() -> bool {
-  if !cfg!(target_os = "linux") {
-    return false;
-  }
-
-  if let Ok(contents) = std::fs::read_to_string("/run/systemd/container") {
-    let normalized = contents.trim().to_ascii_lowercase();
-    if !normalized.is_empty() && (normalized == "lxc" || normalized.contains("lxc")) {
-      return true;
-    }
-  }
-
-  if let Ok(env) = std::fs::read_to_string("/proc/1/environ") {
-    let lower = env.to_ascii_lowercase();
-    if lower.contains("lxc")
-      || lower.contains("container=lxc")
-      || lower.contains("container=lxc-libvirt")
-    {
-      return true;
-    }
-  }
-
-  if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
-    let lower = cgroup.to_ascii_lowercase();
-    if lower.contains("lxc") || lower.contains("/lxc/") || lower.contains("lxc.monitor") {
-      return true;
-    }
-  }
-
-  false
-}
-
 /// AMD UMA in Linux LXC can expose a real GTT pool even when the container RAM
 /// limit is much smaller. In that specific case the GPU pool is the budget
 /// authority; everywhere else keep the conservative `min(ram_free, gtt_free)`
@@ -273,7 +238,7 @@ fn effective_free_bytes_for_policy(snap: &HostMetricsSnapshot, in_lxc: bool) -> 
 /// Post-headroom free bytes across the budget pool(s). Discrete hosts
 /// sum post-headroom VRAM free + post-headroom system-RAM free.
 pub fn effective_free_bytes(snap: &HostMetricsSnapshot) -> u64 {
-  effective_free_bytes_for_policy(snap, linux_lxc_container())
+  effective_free_bytes_for_policy(snap, crate::util::process::linux_lxc_container())
 }
 
 /// Demand floor for a launch: model weights + KV cache at the effective
