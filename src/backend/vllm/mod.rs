@@ -7,7 +7,6 @@
 //!
 //! Plan: `docs/plans/2026-08-10-001-feat-vllm-backend-plan.md`.
 
-pub mod discovery;
 pub mod knobs;
 
 use std::path::{Path, PathBuf};
@@ -21,6 +20,10 @@ use super::{
 };
 use crate::daemon::context::MethodContext;
 use crate::daemon::probe::ProbeOptions;
+use crate::launch::admission::{
+  human_gib, unified_host_reserve_bytes, unified_kv_cache_budget, DEFAULT_KV_CACHE_BYTES,
+  MIN_KV_CACHE_BYTES,
+};
 use crate::launch::params::LaunchParams;
 
 /// Stable backend id. The only place this string is authored.
@@ -78,9 +81,7 @@ impl VllmConfig {
   }
 }
 
-/// Executable name searched on `PATH` when no server is configured. Compiled
-/// out under `test-fixtures` so tests never auto-discover a host `vllm`.
-#[cfg(not(feature = "test-fixtures"))]
+/// Executable name searched on `PATH` when no server is configured.
 const VLLM_BIN: &str = "vllm";
 
 /// Extras heads refused on top of the shared loopback/credential denylist.
@@ -115,24 +116,15 @@ pub const VLLM_FORBIDDEN_EXTRA_HEADS: &[&str] = &[
 /// decision from `backend.vllm.cors`, so it belongs nowhere near the picker.
 const VLLM_KNOB_CORS: &str = "cors";
 
-/// Resolve the launcher **by filesystem existence only — never by running it.**
+/// Resolve the launcher, by existence only — see
+/// [`super::resolve_launcher_by_existence`].
 ///
-/// vLLM builds its argument parser through a device probe: on a host with no
-/// usable accelerator, even `vllm --version` dies with
-/// `RuntimeError: Failed to infer device type`. An exec-based probe would
-/// therefore report "not installed" on exactly the machines where a user is
-/// configuring the binary by hand. Verified against
+/// The concrete case here: vLLM builds its argument parser through a device
+/// probe, so on a host with no usable accelerator even `vllm --version` dies
+/// with `RuntimeError: Failed to infer device type`. Verified against
 /// `vllm 0.19.1+rocm7.13.0rc2` on 2026-08-10.
 pub fn resolve_vllm_binary(configured: Option<&Path>) -> Option<PathBuf> {
-  if let Some(path) = configured {
-    return path.is_file().then(|| path.to_path_buf());
-  }
-  #[cfg(not(feature = "test-fixtures"))]
-  {
-    return which::which(VLLM_BIN).ok();
-  }
-  #[cfg(feature = "test-fixtures")]
-  None
+  super::resolve_launcher_by_existence(configured, VLLM_BIN)
 }
 
 /// The vLLM backend.
@@ -189,7 +181,7 @@ impl Backend for VllmBackend {
     // would fail with EISDIR. The same hook a registry backend uses for its
     // file-less `<scheme>://<name>` paths; here the path is real, it just
     // isn't a single weight file.
-    discovery::is_safetensors_snapshot(path).then(|| self.identify(path, &[]))
+    crate::discovery::hf_repos::is_safetensors_snapshot(path).then(|| self.identify(path, &[]))
   }
 
   fn project_hf_repos(
@@ -198,8 +190,8 @@ impl Backend for VllmBackend {
   ) -> Vec<crate::discovery::DiscoveredModel> {
     candidates
       .iter()
-      .filter(|c| discovery::eligible(c))
-      .map(|c| discovery::project(c, VLLM_BACKEND_ID))
+      .filter(|c| crate::discovery::hf_repos::serves_safetensors_only(c))
+      .map(|c| crate::discovery::hf_repos::project_safetensors_row(c, VLLM_BACKEND_ID))
       .collect()
   }
 
@@ -328,16 +320,14 @@ impl Backend for VllmBackend {
     port: u16,
     probe_timeout: std::time::Duration,
   ) -> bool {
-    // The default rule looks for the recorded *path* in `/v1/models`, but this
-    // backend advertises the served name instead — the whole point of passing
-    // `--served-model-name`. Confirm on that, cross-checked against the path
-    // still being the argv's model argument so a recycled PID serving a
-    // different model of ours cannot pass.
-    let expected = served_model_name(recorded_path);
-    let path_str = recorded_path.to_string_lossy();
-    let argv_agrees = argv.is_empty() || argv.iter().any(|a| *a == path_str);
-    argv_agrees
-      && crate::daemon::orphans::models_endpoint_serves_id(port, &expected, probe_timeout).await
+    super::served_name_adoption_matches(
+      &served_model_name(recorded_path),
+      recorded_path,
+      argv,
+      port,
+      probe_timeout,
+    )
+    .await
   }
 
   fn resolve_launch_binary(
@@ -387,14 +377,17 @@ impl Backend for VllmBackend {
     weights_bytes: u64,
   ) -> super::KnobResolution {
     let mut out = super::KnobResolution::default();
-    // Only an explicit byte cap opts out. A user-set *fraction* used to bail
-    // here too, which left the knob unset AND the admission gate with no
-    // figure to project from — so the one configuration that has frozen this
-    // hardware got neither guard. The fraction is honoured (we insert
-    // nothing), and `projected_cache_bytes` turns it into a demand below.
-    if user_set(params, "kv_cache_memory_bytes") || user_set(params, "gpu_memory_utilization") {
+    // A user-set *fraction* is the whole decision: it governs the startup
+    // check and the pool both, so we insert nothing. It used to bail without
+    // leaving the admission gate a figure to project from either, so the one
+    // configuration that has frozen this hardware got neither guard;
+    // `projected_cache_bytes` turns it into a demand now.
+    if user_set(params, "gpu_memory_utilization") {
       return out;
     }
+    // An explicit byte cap keeps its own value, but it still needs a
+    // companion utilization — see below.
+    let user_cap = user_set(params, "kv_cache_memory_bytes");
     // Fail **safe**, not open. This used to bail whenever the host sampler had
     // no reading yet — which is exactly the state right after a daemon
     // restart, and the launch then took vLLM's pool-sized default: observed at
@@ -414,21 +407,56 @@ impl Backend for VllmBackend {
       // VRAM there, so vLLM's own default is right and we stay out of it.
       return out;
     }
-    let cap = match snapshot.as_ref().filter(|_| sampled) {
+    // The user's own cap is honoured, but on its own it does not launch: vLLM
+    // weighs `total * utilization` against its free reading at `init_device`
+    // and only reads the cap afterwards, so beside a tenant the untouched
+    // 0.92 default refuses the very launch the cap was set to allow. This is
+    // the escape hatch the setup and troubleshooting docs point at, so it has
+    // to work on the host those docs are about. Nothing else is inserted, and
+    // an unsampled host has no pool total to size a fraction against.
+    if user_cap {
+      if let Some(s) = snapshot.as_ref().filter(|_| sampled) {
+        let free = crate::launch::admission::effective_free_bytes(s);
+        if let Some(util) = knob_bytes(params, "kv_cache_memory_bytes")
+          .and_then(|cap| startup_utilization(free, weights_bytes, cap, s.ram_total_bytes))
+        {
+          set_startup_utilization(params, &mut out, util);
+        }
+      }
+      return out;
+    }
+    let (cap, utilization) = match snapshot.as_ref().filter(|_| sampled) {
       Some(s) => {
         let free = crate::launch::admission::effective_free_bytes(s);
-        match kv_cache_cap_bytes(free, weights_bytes) {
-          Some(cap) => cap,
+        // On an APU, GPU memory *is* system RAM, and vLLM sizes its KV cache
+        // to fill whatever `gpu_memory_utilization` allows — a fraction of
+        // the **pool**, not of the model. Measured on a 121 GB Strix Halo:
+        // `0.15` on a 0.5B model reserved 15.1 GiB of KV cache (1.3M tokens,
+        // 644x concurrency for a 2048-token model) and cost 21.2 GB of RAM;
+        // the 0.92 default projects to ~106 GB and has frozen the machine
+        // outright. Clamping the *fraction* does not help, because the
+        // arithmetic is against the wrong number. Capping the cache in bytes
+        // does: vLLM then skips memory profiling entirely and honours it.
+        let reserve = unified_host_reserve_bytes(
+          s.ram_total_bytes,
+          &s.gpu_backend,
+          VLLM_ENGINE_OVERHEAD_BYTES,
+        );
+        match unified_kv_cache_budget(free, weights_bytes, reserve) {
+          Some(cap) => (
+            cap,
+            startup_utilization(free, weights_bytes, cap, s.ram_total_bytes),
+          ),
           None => {
             out.refusal = Some(format!(
               "not enough memory: {} of weights leaves under {} for the KV \
                cache once the {} host reserve is kept free (host has {} \
                available). Lower --ctx, pick a smaller model, or set \
                kv_cache_memory_bytes to override.",
-              human_bytes(weights_bytes),
-              human_bytes(MIN_KV_CACHE_BYTES),
-              human_bytes(UNIFIED_HOST_RESERVE_BYTES),
-              human_bytes(free),
+              human_gib(weights_bytes),
+              human_gib(MIN_KV_CACHE_BYTES),
+              human_gib(reserve),
+              human_gib(free),
             ));
             return out;
           }
@@ -439,7 +467,9 @@ impl Backend for VllmBackend {
           "vllm: no host memory reading yet — capping the KV cache at the default \
            rather than letting the launcher size it against the whole pool"
         );
-        DEFAULT_KV_CACHE_BYTES
+        // No pool total to size a utilization against, so the cap goes alone
+        // and vLLM's startup check is left to its own default.
+        (DEFAULT_KV_CACHE_BYTES, None)
       }
     };
     log::info!("vllm: capping KV cache at {cap} bytes");
@@ -447,74 +477,87 @@ impl Backend for VllmBackend {
       .knobs
       .set_by_name_for(VLLM_BACKEND_ID, "kv-cache-memory-bytes", cap.to_string());
     out.auto_set.insert("kv-cache-memory-bytes".to_string());
+    if let Some(util) = utilization {
+      set_startup_utilization(params, &mut out, util);
+    }
     out
   }
 }
 
-/// A knob's value parsed as a byte count (`8G`, `512M`, or a plain integer).
+/// Write the companion `--gpu-memory-utilization` that clears vLLM's startup
+/// check, marking it auto-set so it never persists into `last_params`.
+///
+/// A rejected value would leave the byte cap facing the 0.92 default, which is
+/// the refusal this exists to prevent, so it is worth a log line rather than a
+/// silent no-op.
+fn set_startup_utilization(params: &mut LaunchParams, out: &mut super::KnobResolution, util: f64) {
+  log::info!("vllm: startup utilization {util:.2} so the byte cap can pass init");
+  if params.knobs.set_by_name_for(
+    VLLM_BACKEND_ID,
+    "gpu-memory-utilization",
+    format!("{util:.2}"),
+  ) {
+    out.auto_set.insert("gpu-memory-utilization".to_string());
+  } else {
+    log::warn!(
+      "vllm: the startup utilization {util:.2} was rejected by the knob; the \
+       byte cap now faces vLLM's own default startup check"
+    );
+  }
+}
+
+/// This backend's knob accessors, bound to its own vocabulary.
 fn knob_bytes(params: &LaunchParams, id: &str) -> Option<u64> {
-  crate::launch::admission::parse_size_bytes(&params.knobs.text_by_name_for(VLLM_BACKEND_ID, id)?)
+  crate::launch::params::knob_bytes(params, VLLM_BACKEND_ID, id)
 }
 
-/// A knob's value parsed as a fraction.
 fn knob_f64(params: &LaunchParams, id: &str) -> Option<f64> {
-  params
-    .knobs
-    .text_by_name_for(VLLM_BACKEND_ID, id)?
-    .trim()
-    .parse()
-    .ok()
+  crate::launch::params::knob_f64(params, VLLM_BACKEND_ID, id)
 }
 
-/// Whether the user pinned this knob (as opposed to leaving it to us).
 fn user_set(params: &LaunchParams, id: &str) -> bool {
-  params.knobs.is_set_by_name_for(VLLM_BACKEND_ID, id)
+  crate::launch::params::knob_is_user_set(params, VLLM_BACKEND_ID, id)
 }
 
-/// Default KV cache budget when nothing else bounds it. Generous for a single
-/// user (~85x concurrency at 2k context on a 0.5B) and small enough that the
-/// launch cannot take the host down.
-const DEFAULT_KV_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// vLLM's footprint beyond weights + cache on a unified host: CUDA context,
+/// workspace, CUDA-graph memory, the API server. Measured on a DGX Spark
+/// (GB10) with vLLM 0.28: 5.4 GiB on a 0.5B and 6.7 GiB on a 30B-A3B, the
+/// spread being graph memory (1.0 -> 3.0 GiB). The ceiling, rounded up. Two
+/// models on one box, so a figure to check elsewhere, not a law; the escape
+/// hatch is an explicit `kv_cache_memory_bytes`.
+const VLLM_ENGINE_OVERHEAD_BYTES: u64 = 7 * 1024 * 1024 * 1024;
 
-/// `1.5 GiB`-style label for a refusal message.
-fn human_bytes(b: u64) -> String {
-  const GIB: f64 = (1024 * 1024 * 1024) as f64;
-  format!("{:.1} GiB", b as f64 / GIB)
-}
+/// How far vLLM's own free reading at `init_device` sits under MemAvailable:
+/// the container and the CUDA context are already spent when it samples.
+/// Measured 2.6-2.7 GiB on GB10, rounded up.
+const VLLM_CONTEXT_MARGIN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
-/// Floor for the cap. Below this the cache cannot serve a useful context, so
-/// the launch is refused outright rather than admitted with a token cache that
-/// would only fail after a full weight load.
-const MIN_KV_CACHE_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Reserve left free for the OS and everything else after weights + cache.
-const UNIFIED_HOST_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// The KV cache cap for a unified-memory host. **Always a value.**
+/// The `--gpu-memory-utilization` that lets a byte-capped launch through
+/// vLLM's startup check, or `None` when the pool total is unknown.
 ///
-/// On an APU, GPU memory *is* system RAM, and vLLM sizes its KV cache to fill
-/// whatever `gpu_memory_utilization` allows — a fraction of the **pool**, not
-/// of the model. Measured on a 121 GB Strix Halo: `0.15` on a 0.5B model
-/// reserved 15.1 GiB of KV cache (1.3M tokens, 644x concurrency for a
-/// 2048-token model) and cost 21.2 GB of RAM; the 0.92 default projects to
-/// ~106 GB and has frozen the machine outright. Clamping the *fraction* does
-/// not help, because the arithmetic is against the wrong number. Capping the
-/// cache in bytes does: vLLM then skips memory profiling entirely and honours
-/// the figure.
-///
-/// `None` means **refuse the launch**, not "no opinion".
-///
-/// An earlier version floored the cap instead of refusing, on the theory that
-/// the admission gate would catch the tight case. It cannot: the gate's demand
-/// is weights + *this* figure, so shrinking the figure shrinks the very term
-/// the gate evaluates, and a launch that should have been refused was admitted
-/// with the host reserve silently abandoned. Whoever decides there is not
-/// enough memory has to be whoever holds the number, which is here.
-fn kv_cache_cap_bytes(free_bytes: u64, weights_bytes: u64) -> Option<u64> {
-  let headroom = free_bytes
-    .saturating_sub(weights_bytes)
-    .saturating_sub(UNIFIED_HOST_RESERVE_BYTES);
-  (headroom >= MIN_KV_CACHE_BYTES).then(|| headroom.min(DEFAULT_KV_CACHE_BYTES))
+/// vLLM 0.28 compares its free reading against `total * utilization` at
+/// `init_device`, before weights and regardless of `--kv-cache-memory-bytes`,
+/// which it only honours later. So the cap alone launches only on a host that
+/// is ~92% free (the default fraction), and any co-tenant makes vLLM refuse.
+/// Once the cap is set the fraction governs nothing else, so it only has to
+/// clear the check: the real demand (weights + cap + engine overhead), or
+/// what vLLM will see as free if that is less, floored to two decimals.
+fn startup_utilization(
+  free_bytes: u64,
+  weights_bytes: u64,
+  cap_bytes: u64,
+  ram_total_bytes: u64,
+) -> Option<f64> {
+  if ram_total_bytes == 0 {
+    return None;
+  }
+  let demand = weights_bytes
+    .saturating_add(cap_bytes)
+    .saturating_add(VLLM_ENGINE_OVERHEAD_BYTES);
+  let visible_free = free_bytes.saturating_sub(VLLM_CONTEXT_MARGIN_BYTES);
+  let bytes = demand.min(visible_free);
+  let util = (bytes as f64 / ram_total_bytes as f64 * 100.0).floor() / 100.0;
+  Some(util.clamp(0.01, 0.99))
 }
 
 impl VllmBackend {
@@ -542,7 +585,7 @@ impl VllmBackend {
 /// path into `/v1/models` and force clients to name it in requests. The repo
 /// id is what the catalog shows, so the proxy, the catalog and vLLM all agree.
 pub fn served_model_name(model_path: &Path) -> String {
-  discovery::repo_id_for_snapshot(model_path)
+  crate::discovery::hf_repos::repo_id_for_snapshot(model_path)
     .or_else(|| {
       model_path
         .file_name()
@@ -623,29 +666,11 @@ fn vllm_argv(params: &LaunchParams, port: u16) -> Vec<std::ffi::OsString> {
     VLLM_FORBIDDEN_EXTRA_HEADS,
   ));
   // The `-- <extras>` tail carries the ~230 flags that have no typed knob.
-  // `compose_and_spawn` already refused a banned head with a clear error;
-  // this strip is the belt-and-suspenders that guarantees none reaches the
-  // launcher even if some path skipped the fail-fast.
-  let mut skip_value = false;
-  for e in &params.extras {
-    let lossy = e.to_string_lossy();
-    // Drop the value token that belonged to a flag we just stripped. Without
-    // this the space-separated form leaves `0.0.0.0` dangling in argv, which
-    // vLLM reads as a stray positional and refuses the launch over.
-    if skip_value {
-      skip_value = false;
-      if !lossy.starts_with('-') {
-        continue;
-      }
-    }
-    let head = lossy.split('=').next().unwrap_or(&lossy);
-    if crate::launch::params::is_forbidden_head_ext(head, VLLM_FORBIDDEN_EXTRA_HEADS) {
-      log::warn!("vllm_argv: stripping forbidden extra {head:?}");
-      skip_value = !lossy.contains('=');
-      continue;
-    }
-    argv.push(e.clone());
-  }
+  argv.extend(crate::launch::params::strip_forbidden_extras(
+    &params.extras,
+    VLLM_FORBIDDEN_EXTRA_HEADS,
+    "vllm_argv",
+  ));
   argv
 }
 
@@ -919,26 +944,47 @@ mod tests {
     }
   }
 
-  /// The freeze guard. vLLM's default sizes the KV cache against the pool,
-  /// which on a UMA host is system RAM — measured at ~106 GB of a 121 GB box.
+  /// vLLM 0.28 refuses at init when `total * utilization` exceeds *its* free
+  /// reading, which runs ~2.7 GiB under MemAvailable. Measured on GB10 beside
+  /// a 52 GiB-available tenant: the cap alone was refused against the 0.92
+  /// default; this fraction has to clear the number vLLM actually tests.
   #[test]
-  fn kv_cap_leaves_the_host_a_reserve_and_is_never_absent() {
-    const GB: u64 = 1024 * 1024 * 1024;
-    // Plenty free: the default budget applies, not "everything that fits".
-    assert_eq!(kv_cache_cap_bytes(113 * GB, GB), Some(8 * GB));
-    // Tight: the cap shrinks to what is left after weights + reserve.
-    assert_eq!(kv_cache_cap_bytes(20 * GB, 8 * GB), Some(4 * GB));
-    // Too tight to serve a useful context: refuse. Flooring instead used to
-    // shrink the demand the admission gate evaluates, so the gate could not
-    // fire and the launch went ahead with the host reserve abandoned.
-    assert_eq!(kv_cache_cap_bytes(10 * GB, 8 * GB), None);
-    assert_eq!(kv_cache_cap_bytes(4 * GB, 8 * GB), None);
-    assert_eq!(kv_cache_cap_bytes(0, 0), None);
-    // The exact boundary is admitted, not refused.
-    assert_eq!(
-      kv_cache_cap_bytes(8 * GB + MIN_KV_CACHE_BYTES, 0),
-      Some(MIN_KV_CACHE_BYTES)
+  fn startup_utilization_clears_the_init_check_against_what_vllm_sees() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let spark_total: u64 = 130_657_042_432;
+    let free = 52 * GIB;
+    let weights = 998_244_352; // 0.93 GiB
+    let cap = 8 * GIB;
+    let util = startup_utilization(free, weights, cap, spark_total).expect("sampled");
+    // The real demand: 0.93 + 8 + 7 = 15.93 GiB of 121.69 -> 0.13.
+    assert_eq!(util, 0.13);
+    let requested = (spark_total as f64 * util) as u64;
+    assert!(
+      requested >= weights + cap,
+      "must at least cover weights + cap"
     );
+    // vLLM's own `init_snapshot.free_memory` in that run: 49.84 GiB.
+    assert!(
+      requested <= 53_515_000_000,
+      "must sit under the free vLLM saw"
+    );
+
+    // A host whose visible free sits under the demand sizes the fraction to
+    // the visible free instead, so the init check still passes. These are the
+    // pre-fix binding numbers; the reserve now refuses this host outright
+    // (see `a_host_the_reserve_refuses_never_reaches_the_utilization`), so
+    // this exercises the branch, not a reachable production state.
+    let tight = startup_utilization(34_789_580_800, 21_583_783_921, 4_609_873_935, spark_total)
+      .expect("sampled");
+    // vLLM saw 29.83 GiB free in that run; without the context margin the
+    // fraction rounds to 0.25 and asks for 30.4 GiB, which vLLM refuses.
+    assert!((spark_total as f64 * tight) as u64 <= 32_029_000_000);
+    assert!(tight >= 0.20, "still a real fraction, not the clamp floor");
+
+    // No pool total (unsampled): nothing to size against.
+    assert_eq!(startup_utilization(free, weights, cap, 0), None);
+    // Nothing visible free: the clamp floor, never zero.
+    assert_eq!(startup_utilization(GIB, 0, 0, spark_total), Some(0.01));
   }
 
   #[test]
@@ -951,6 +997,113 @@ mod tests {
       .position(|a| a == "--kv-cache-memory-bytes")
       .expect("the cap must reach argv");
     assert_eq!(argv[i + 1], "2147483648");
+  }
+
+  /// A sampled unified host with `free` available out of `total`.
+  fn uma_host(free: u64, total: u64) -> crate::daemon::host_metrics::HostMetricsSnapshot {
+    crate::daemon::host_metrics::HostMetricsSnapshot {
+      gpu_backend: crate::daemon::host_metrics::HostMetricsSnapshot::BACKEND_NVIDIA.to_string(),
+      unified: true,
+      ram_total_bytes: total,
+      ram_used_bytes: total - free,
+      ..Default::default()
+    }
+  }
+
+  fn ctx_with_host(
+    snap: crate::daemon::host_metrics::HostMetricsSnapshot,
+  ) -> crate::daemon::context::MethodContext {
+    let mut ctx =
+      crate::daemon::context::MethodContext::new(crate::daemon::shutdown::ShutdownToken::new());
+    ctx.host_metrics = Some(std::sync::Arc::new(tokio::sync::RwLock::new(snap)));
+    ctx
+  }
+
+  /// The escape hatch the docs point at has to work on the host the docs are
+  /// about. An explicit cap keeps its value, but vLLM weighs
+  /// `total * utilization` against its own free reading before it ever reads
+  /// the cap, so without a companion fraction the untouched 0.92 default
+  /// refuses the launch beside a tenant — the failure the cap was set to
+  /// avoid.
+  #[tokio::test]
+  async fn an_explicit_cap_still_gets_a_companion_startup_utilization() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let b = VllmBackend::new();
+    let total = 130_657_042_432;
+    let ctx = ctx_with_host(uma_host(52 * GIB, total));
+
+    let mut p = params("/c/models--o--n/snapshots/rev");
+    set(
+      &mut p,
+      "kv_cache_memory_bytes",
+      (8 * GIB).to_string().as_str(),
+    );
+    let out = b.resolve_knobs(&ctx, &mut p, 998_244_352).await;
+
+    assert!(out.refusal.is_none(), "an explicit cap is never refused");
+    let util = p
+      .knobs
+      .text_by_name_for(VLLM_BACKEND_ID, "gpu-memory-utilization")
+      .expect("the companion utilization must be set");
+    assert!(
+      (total as f64 * util.parse::<f64>().unwrap()) as u64 >= 998_244_352 + 8 * GIB,
+      "the fraction must cover weights + the user's cap, got {util}"
+    );
+    assert!(
+      out.auto_set.contains("gpu-memory-utilization"),
+      "auto-set, so it never persists into last_params"
+    );
+    // Their cap is untouched.
+    assert_eq!(
+      knob_bytes(&p, "kv_cache_memory_bytes"),
+      Some(8 * GIB),
+      "the user's cap must survive verbatim"
+    );
+  }
+
+  /// A user-set fraction is the whole decision, so nothing is inserted
+  /// alongside it.
+  #[tokio::test]
+  async fn a_user_fraction_is_left_entirely_alone() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let b = VllmBackend::new();
+    let ctx = ctx_with_host(uma_host(52 * GIB, 130_657_042_432));
+    let mut p = params("/c/models--o--n/snapshots/rev");
+    set(&mut p, "gpu_memory_utilization", "0.5");
+
+    let out = b.resolve_knobs(&ctx, &mut p, GIB).await;
+    assert!(
+      out.auto_set.is_empty(),
+      "nothing inserted: {:?}",
+      out.auto_set
+    );
+    assert_eq!(
+      p.knobs
+        .text_by_name_for(VLLM_BACKEND_ID, "gpu-memory-utilization")
+        .as_deref(),
+      Some("0.5")
+    );
+    assert_eq!(knob_bytes(&p, "kv_cache_memory_bytes"), None);
+  }
+
+  /// The two halves of #80 interact: the engine-aware reserve refuses the
+  /// host state that the pre-fix binding run launched on, so the utilization
+  /// branch sized against a too-tight host is unreachable in production. The
+  /// `startup_utilization` test covers that arithmetic as a pure function.
+  #[test]
+  fn a_host_the_reserve_refuses_never_reaches_the_utilization() {
+    let spark_total: u64 = 130_657_042_432;
+    let reserve = unified_host_reserve_bytes(
+      spark_total,
+      crate::daemon::host_metrics::HostMetricsSnapshot::BACKEND_NVIDIA,
+      VLLM_ENGINE_OVERHEAD_BYTES,
+    );
+    // The measured pre-fix binding run: 32.4 GiB free, 20.1 GiB of weights.
+    assert_eq!(
+      unified_kv_cache_budget(34_789_580_800, 21_583_783_921, reserve),
+      None,
+      "the engine-aware reserve refuses this host outright"
+    );
   }
 
   /// A user-set fraction is a real configuration, not a reason to

@@ -48,6 +48,7 @@ pub mod identity;
 pub mod lemonade;
 pub mod llama_cpp;
 pub mod server;
+pub mod sglang;
 pub mod vllm;
 
 pub use server::{
@@ -72,6 +73,7 @@ use crate::backend::ds4::Ds4Backend;
 use crate::backend::identity::ModelIdentity;
 use crate::backend::lemonade::LemonadeBackend;
 use crate::backend::llama_cpp::LlamaCppBackend;
+use crate::backend::sglang::SglangBackend;
 use crate::backend::vllm::VllmBackend;
 use crate::daemon::context::MethodContext;
 use crate::daemon::probe::ProbeOptions;
@@ -913,6 +915,7 @@ pub struct BackendConfig {
   pub lemonade: crate::backend::lemonade::LemonadeConfig,
   pub ds4: crate::backend::ds4::Ds4Config,
   pub vllm: crate::backend::vllm::VllmConfig,
+  pub sglang: crate::backend::sglang::SglangConfig,
 }
 
 /// Zero-cost, exhaustive dispatch over the available backends.
@@ -931,6 +934,8 @@ pub enum Backends {
   Ds4(Ds4Backend),
   /// vLLM — direct process-per-model for safetensors HF repos.
   Vllm(VllmBackend),
+  /// SGLang — direct process-per-model for safetensors HF repos.
+  Sglang(SglangBackend),
 }
 
 /// Forward a [`Backend`] call to whichever [`Backends`] variant is active.
@@ -948,6 +953,7 @@ macro_rules! for_each_backend {
       Backends::Lemonade($b) => $body,
       Backends::Ds4($b) => $body,
       Backends::Vllm($b) => $body,
+      Backends::Sglang($b) => $body,
     }
   };
 }
@@ -966,6 +972,7 @@ impl Backends {
       Backends::Lemonade(LemonadeBackend::new()),
       Backends::Ds4(Ds4Backend::new()),
       Backends::Vllm(VllmBackend::new()),
+      Backends::Sglang(SglangBackend::new()),
     ]
   }
 }
@@ -1327,15 +1334,31 @@ pub fn umbrella_owner(id: &crate::daemon::registry::LaunchId) -> Option<Backends
 
 /// Mint the synthetic [`ModelIdentity`] for a **file-less** catalog `path`, plus
 /// the id of the backend that owns it. The generic replacement for hand-minting
-/// a backend-registry identity in the launch / status path: returns the first
-/// backend whose [`Backend::synthetic_identity`] claims `path` (paired with that
-/// backend's [`Backend::id`], which callers stamp as `resolved_backend`), or
-/// `None` for a local-file (GGUF) path no backend synthesizes. Names no backend.
+/// a backend-registry identity in the launch / status path: returns the
+/// highest-priority backend whose [`Backend::synthetic_identity`] claims `path`
+/// (paired with that backend's [`Backend::id`], which callers stamp as
+/// `resolved_backend`), or `None` for a local-file (GGUF) path no backend
+/// synthesizes. Names no backend.
 pub fn synthetic_identity_for_path(path: &Path) -> Option<(ModelIdentity, String)> {
-  Backends::all().into_iter().find_map(|b| {
+  claimants_by_priority().into_iter().find_map(|b| {
     b.synthetic_identity(path)
       .map(|id| (id, b.id().to_string()))
   })
+}
+
+/// [`Backends::all`] ordered the way routing decides, highest
+/// [`Backend::launch_priority`] first, ties keeping registration order.
+///
+/// The identity a claimed path mints picks its backend, so this has to be the
+/// **same** order [`supported_backends_for`] publishes for a GGUF row and
+/// `discovery_task` folds a multi-engine row in. Walking registration order
+/// here instead let a row advertise one engine as its auto default while
+/// routing silently chose another; the two agreed only because the engine that
+/// registered first also happened to outrank the others.
+fn claimants_by_priority() -> Vec<Backends> {
+  let mut backends = Backends::all();
+  backends.sort_by_key(|b| std::cmp::Reverse(b.launch_priority()));
+  backends
 }
 
 /// [`synthetic_identity_for_path`] restricted to backends that are actually
@@ -1351,13 +1374,64 @@ pub fn synthetic_identity_for_path_available(
   path: &Path,
   ctx: &MethodContext,
 ) -> Option<(ModelIdentity, String)> {
-  Backends::all()
+  claimants_by_priority()
     .into_iter()
     .filter(|b| b.available(ctx))
     .find_map(|b| {
       b.synthetic_identity(path)
         .map(|id| (id, b.id().to_string()))
     })
+}
+
+/// Resolve an engine launcher **by filesystem existence only — never by
+/// running it.**
+///
+/// The Python engines build their argument parser after importing the engine,
+/// which probes for a device, so a `--version` on a GPU-less host fails
+/// outright. An exec-based probe would report "not installed" on exactly the
+/// machines where a user is configuring the binary by hand.
+///
+/// A configured path must be a file; otherwise `path_name` is looked up on
+/// `PATH`. Under `test-fixtures` the `PATH` lookup is compiled out so tests
+/// never auto-discover a real engine installed on the host.
+pub fn resolve_launcher_by_existence(
+  configured: Option<&Path>,
+  path_name: &str,
+) -> Option<PathBuf> {
+  if let Some(path) = configured {
+    return path.is_file().then(|| path.to_path_buf());
+  }
+  #[cfg(not(feature = "test-fixtures"))]
+  {
+    return which::which(path_name).ok();
+  }
+  #[cfg(feature = "test-fixtures")]
+  {
+    let _ = path_name;
+    None
+  }
+}
+
+/// Orphan re-adoption for a backend that advertises a **served name** rather
+/// than the model path.
+///
+/// The default rule looks for the recorded path in `/v1/models`, which never
+/// matches an engine handed `--served-model-name`. Confirm on the name
+/// instead, cross-checked against the path still being the argv's model
+/// argument so a recycled PID serving a different model of ours cannot pass.
+/// An unreadable argv (empty) falls back to the name alone rather than
+/// dropping a live child.
+pub async fn served_name_adoption_matches(
+  served_name: &str,
+  recorded_path: &Path,
+  argv: &[String],
+  port: u16,
+  probe_timeout: std::time::Duration,
+) -> bool {
+  let path_str = recorded_path.to_string_lossy();
+  let argv_agrees = argv.is_empty() || argv.iter().any(|a| *a == path_str);
+  argv_agrees
+    && crate::daemon::orphans::models_endpoint_serves_id(port, served_name, probe_timeout).await
 }
 
 /// Everything a surface needs to identify a model path, whichever shape the
@@ -1859,7 +1933,7 @@ mod tests {
     // construction (one `all()` line), which is what makes it surface in
     // `status` / `doctor` / `--backend` without editing those sites.
     let ids: Vec<&str> = Backends::all().iter().map(|b| b.id()).collect();
-    assert_eq!(ids, vec!["llamacpp", "lemonade", "ds4", "vllm"]);
+    assert_eq!(ids, vec!["llamacpp", "lemonade", "ds4", "vllm", "sglang"]);
     // Forwarding through the macro reaches each variant's real lifecycle.
     let by_id: std::collections::BTreeMap<&str, Lifecycle> = Backends::all()
       .iter()
@@ -1869,6 +1943,70 @@ mod tests {
     assert_eq!(by_id["lemonade"], Lifecycle::ManagedMultiplexer);
     assert_eq!(by_id["ds4"], Lifecycle::ProcessPerModel);
     assert_eq!(by_id["vllm"], Lifecycle::ProcessPerModel);
+    assert_eq!(by_id["sglang"], Lifecycle::ProcessPerModel);
+  }
+
+  /// Routing order is priority, not registration order. Two engines claim a
+  /// safetensors snapshot, and the identity the path mints is what
+  /// `backend_for_identity` routes an `auto` launch to — so it has to name the
+  /// same engine the catalog row advertises first, or a row's badge and the
+  /// launcher disagree.
+  #[test]
+  fn a_path_two_backends_claim_mints_the_higher_priority_identity() {
+    let dir = crate::util::test_temp::unique_temp_dir("claim-priority");
+    std::fs::write(dir.join("model.safetensors"), b"\0").unwrap();
+
+    let (identity, backend) =
+      synthetic_identity_for_path(&dir).expect("a safetensors snapshot must be claimed");
+    let claimants: Vec<&str> = Backends::all()
+      .iter()
+      .filter(|b| b.synthetic_identity(&dir).is_some())
+      .map(|b| b.id())
+      .collect();
+    assert!(
+      claimants.len() > 1,
+      "this test is only meaningful while two engines claim one snapshot: {claimants:?}"
+    );
+
+    let top = claimants
+      .iter()
+      .max_by_key(|id| {
+        Backends::all()
+          .iter()
+          .find(|b| b.id() == **id)
+          .map(|b| b.launch_priority())
+          .unwrap_or(i32::MIN)
+      })
+      .copied()
+      .unwrap();
+    assert_eq!(backend, top, "claimants: {claimants:?}");
+    // The routing half: an `auto` launch on this identity lands on the same id.
+    assert_eq!(backend_for_identity(&identity).id(), top);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// The sort above is load-bearing, and the ids alone cannot show it: the two
+  /// safetensors engines happen to register in priority order, so the claim
+  /// test passes either way. This pins the mechanism instead.
+  #[test]
+  fn claimants_are_walked_in_priority_order_not_registration_order() {
+    let sorted: Vec<&str> = claimants_by_priority().iter().map(|b| b.id()).collect();
+    let registered: Vec<&str> = Backends::all().iter().map(|b| b.id()).collect();
+    assert_ne!(
+      sorted, registered,
+      "registration order already is priority order, so this test proves nothing; \
+       re-derive it against the real priorities"
+    );
+
+    let priorities: Vec<i32> = claimants_by_priority()
+      .iter()
+      .map(|b| b.launch_priority())
+      .collect();
+    assert!(
+      priorities.windows(2).all(|w| w[0] >= w[1]),
+      "not priority-ordered: {:?}",
+      sorted.iter().zip(&priorities).collect::<Vec<_>>()
+    );
   }
 
   fn ds4_header() -> GgufHeader {
